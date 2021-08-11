@@ -1,5 +1,6 @@
 import torch
 
+from nets.blocks.blocks import STVEN_Block, STConvBlock
 from ..funcs.complexFunctions import complex_matmul
 
 
@@ -174,3 +175,82 @@ class ResBlock_CBAM(torch.nn.Module):
         out += residual
         out = self.relu(out)
         return out
+
+
+class STVENDownSamplingModule(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, label_channels):
+        super(STVENDownSamplingModule, self).__init__()
+
+        self.stven_block1 = STVEN_Block(in_channels + label_channels, out_channels, (3, 7, 7), (1, 1, 1), (1, 3, 3))
+        self.stven_block2 = STVEN_Block(out_channels, out_channels * 2, (3, 4, 4), (1, 2, 2), (1, 1, 1))
+        self.stven_block3 = STVEN_Block(out_channels * 2, out_channels * 8, (4, 4, 4), (2, 2, 2), (1, 1, 1))
+
+    def forward(self, x):
+        x = self.stven_block1(x)
+        x = self.stven_block2(x)
+        x = self.stven_block3(x)
+        return x
+
+
+class STVENBottleneck(torch.nn.Module):
+    def __init__(self, in_channels, repeat):
+        super(STVENBottleneck, self).__init__()
+        self.layers = []
+        for i in range(repeat):
+            self.layers.append(STConvBlock(in_channels, in_channels, [3, 3, 3], (1, 1, 1), [1, 1, 1]))
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class STVENUpSamplingModule(torch.nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(STVENUpSamplingModule, self).__init__()
+
+        self.stven_block1 = STVEN_Block(in_channels, in_channels // 4, (4, 4, 4), (2, 2, 2), (1, 1, 1))
+        self.stven_block2 = STVEN_Block(in_channels // 4, in_channels // 8, (1, 4, 4), (1, 2, 2), (0, 1, 1))
+        self.out_conv3d = torch.nn.Conv3d(in_channels // 16, out_channels, (1, 7, 7), (1, 1, 1), (0, 3, 3), False)
+        self.tanh = torch.nn.Tanh()
+
+    def forward(self, x):
+        x = self.stven_block1(x)
+        x = self.stven_block2(x)
+        x = self.out_conv3d(x)
+        x = self.tanh(x)
+        return x
+
+
+class MixAttentionModule(torch.nn.Module):
+    '''
+    Spatial-skin attention module
+    '''
+
+    def __init__(self):
+        super(MixAttentionModule, self).__init__()
+        self.softmax = torch.nn.Softmax(dim=-1)
+        self.AVGpool = torch.nn.AdaptiveAvgPool1d(1)
+        self.MAXpool = torch.nn.AdaptiveMaxPool1d(1)
+
+    def forward(self, x, skin):
+        """
+            inputs :
+                x : input feature maps( B X C X T x W X H)
+                skin : skin confidence maps( B X T x W X H)
+            returns :
+                out : attention value
+                spatial attention: W x H
+        """
+        m_batchsize, C, T, W, H = x.size()
+        B_C_TWH = x.view(m_batchsize, C, -1)
+        B_TWH_C = x.view(m_batchsize, C, -1).permute(0, 2, 1)
+        B_TWH_C_AVG = torch.sigmoid(self.AVGpool(B_TWH_C)).view(m_batchsize, T, W, H)
+        B_TWH_C_MAX = torch.sigmoid(self.MAXpool(B_TWH_C)).view(m_batchsize, T, W, H)
+        B_TWH_C_Fusion = B_TWH_C_AVG + B_TWH_C_MAX + skin
+        Attention_weight = self.softmax(B_TWH_C_Fusion.view(m_batchsize, T, -1))
+        Attention_weight = Attention_weight.view(m_batchsize, T, W, H)
+        # mask1 mul
+        output = x.clone()
+        for i in range(C):
+            output[:, i, :, :, :] = output[:, i, :, :, :].clone() * Attention_weight
+
+        return output, Attention_weight
